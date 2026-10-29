@@ -177,7 +177,7 @@ export const useWaveformRegions = ({
     };
 
     // Called whenever a region is dragged/resized
-    const handleRegionUpdate = (region: Region) => {
+    const handleRegionUpdate = (region: Region, isCommit: boolean = true) => {
       const subtitleUuid = region.id;
       if (subtitleUuid.startsWith("preview-")) {
         return;
@@ -257,30 +257,47 @@ export const useWaveformRegions = ({
       }
 
       const trackRegions = Array.from(subtitleToRegionMap.current.values())
-        .filter((regionData) => regionData.trackId === currentTrack?.id)
+        .filter(
+          (regionData) =>
+            regionData.trackId === currentTrack?.id &&
+            regionData.region.id !== subtitleUuid,
+        )
         .map((regionData) => regionData.region)
         .sort((a, b) => a.start - b.start);
 
-      const currentIndex = trackRegions.findIndex((r) => r.id === subtitleUuid);
+      let prevNeighborEnd: number | null = prevOrderedRegion
+        ? prevOrderedRegion.end
+        : null;
+      let nextNeighborStart: number | null = nextOrderedRegion
+        ? nextOrderedRegion.start
+        : null;
 
-      const prevRegion =
-        currentIndex > 0 ? trackRegions[currentIndex - 1] : null;
-      const nextRegion =
-        currentIndex < trackRegions.length - 1
-          ? trackRegions[currentIndex + 1]
-          : null;
+      for (const otherRegion of trackRegions) {
+        if (
+          otherRegion.end <= newEndTime &&
+          (prevNeighborEnd === null || otherRegion.end > prevNeighborEnd)
+        ) {
+          prevNeighborEnd = otherRegion.end;
+        }
+        if (
+          otherRegion.start >= newStartTime &&
+          (nextNeighborStart === null || otherRegion.start < nextNeighborStart)
+        ) {
+          nextNeighborStart = otherRegion.start;
+        }
+      }
 
       if (clampOverlaps) {
-        if (prevRegion && newStartTime < prevRegion.end) {
-          newStartTime = prevRegion.end;
+        if (prevNeighborEnd !== null && newStartTime < prevNeighborEnd) {
+          newStartTime = prevNeighborEnd;
           if (newStartTime >= newEndTime) {
             newEndTime = newStartTime + 0.1;
           }
         }
-        if (nextRegion && newEndTime > nextRegion.start) {
-          newEndTime = nextRegion.start;
+        if (nextNeighborStart !== null && newEndTime > nextNeighborStart) {
+          newEndTime = nextNeighborStart;
           if (newEndTime <= newStartTime) {
-            newStartTime = newEndTime - 0.1;
+            newStartTime = Math.max(0, newEndTime - 0.1);
           }
         }
       }
@@ -308,14 +325,16 @@ export const useWaveformRegions = ({
       // Mark this subtitle as being dragged to avoid re-rendering it
       lastDraggedSubtitleId.current = subtitleUuid;
 
-      // Do not auto switch tabs or scroll during drag; only update times
-      // Call context action with the UUID to update the correct subtitle in the correct track
-      updateSubtitleTimeByUuidAction(
-        subtitleUuid,
-        newStartTimeFormatted,
-        newEndTimeFormatted,
-      );
-      requestAnimationFrame(measureLabelsOverlay);
+      if (isCommit) {
+        // Do not auto switch tabs or scroll during drag; only update times
+        // Call context action with the UUID to update the correct subtitle in the correct track
+        updateSubtitleTimeByUuidAction(
+          subtitleUuid,
+          newStartTimeFormatted,
+          newEndTimeFormatted,
+        );
+        requestAnimationFrame(measureLabelsOverlay);
+      }
     };
 
     // Handle region clicks to switch active track and focus subtitle
@@ -342,9 +361,17 @@ export const useWaveformRegions = ({
     wavesurfer.on("play", handlePlay);
     wavesurfer.on("pause", handlePause);
 
+    const handleRegionUpdateRealtime = (region: Region) => {
+      handleRegionUpdate(region, false);
+    };
+    const handleRegionUpdateCommit = (region: Region) => {
+      handleRegionUpdate(region, true);
+    };
+
     const regionsPlugin = getRegionsPlugin(wavesurfer);
     if (regionsPlugin) {
-      regionsPlugin.on("region-updated", handleRegionUpdate);
+      regionsPlugin.on("region-update", handleRegionUpdateRealtime);
+      regionsPlugin.on("region-updated", handleRegionUpdateCommit);
       regionsPlugin.on("region-clicked", handleRegionClick);
     }
 
@@ -359,7 +386,8 @@ export const useWaveformRegions = ({
       wavesurfer.un("play", handlePlay);
       wavesurfer.un("pause", handlePause);
       if (regionsPlugin) {
-        regionsPlugin.un("region-updated", handleRegionUpdate);
+        regionsPlugin.un("region-update", handleRegionUpdateRealtime);
+        regionsPlugin.un("region-updated", handleRegionUpdateCommit);
         regionsPlugin.un("region-clicked", handleRegionClick);
       }
       window.removeEventListener("pointerup", handlePointerUp);

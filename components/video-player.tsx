@@ -6,9 +6,10 @@ import {
   type BrowserMediaSupport,
   type MediaFormatSupport,
 } from "@/lib/media-support";
-import { subtitlesToVttString } from "@/lib/format";
 import { warnDev } from "@/lib/log";
+import { findActiveSubtitleIndex } from "@/lib/subtitle-lookup";
 import { CUE_PREVIEW_SEEK_OFFSET_SECONDS } from "@/lib/subtitle-playback";
+import { timeToSeconds } from "@/lib/utils";
 import { shouldIgnorePauseWhileHidden } from "@/hooks/use-visibility-playback";
 import { useTranslations } from "next-intl";
 import {
@@ -19,6 +20,7 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -62,11 +64,11 @@ const VideoPlayer = forwardRef(function VideoPlayer(
   const subtitles = useSubtitles();
 
   const [mediaUrl, setMediaUrl] = useState<string>("");
-  const [vttUrl, setVttUrl] = useState<string | null>(null);
+  const [currentPlaybackTime, setCurrentPlaybackTime] =
+    useState<number>(seekTime);
   const [browserMediaSupport, setBrowserMediaSupport] =
     useState<BrowserMediaSupport | null>(null);
   const playerRef = useRef<HTMLVideoElement | null>(null);
-  const vttObjectUrlRef = useRef<string | null>(null);
   const timeToRestore = useRef<number | null>(null); // Ref to store time before remount
 
   const setVideoRef = useCallback((element: HTMLVideoElement | null) => {
@@ -126,12 +128,15 @@ const VideoPlayer = forwardRef(function VideoPlayer(
       const currentTime = player.currentTime ?? 0;
       const seekDelta = Math.abs(currentTime - seekTime);
       if (
-        seekDelta > 0.5 ||
+        seekDelta > 0.05 ||
         (seekDelta > 0 && seekDelta <= CUE_PREVIEW_SEEK_OFFSET_SECONDS * 2)
       ) {
-        player.currentTime = seekTime;
+        if (player.readyState >= 1) {
+          player.currentTime = seekTime;
+        }
         timeToRestore.current = seekTime;
       }
+      setCurrentPlaybackTime(seekTime);
     }
   }, [seekTime]);
 
@@ -164,45 +169,40 @@ const VideoPlayer = forwardRef(function VideoPlayer(
     return () => URL.revokeObjectURL(url);
   }, [mediaFile]);
 
-  useEffect(() => {
-    if (!mediaUrl) {
-      setVttUrl(null);
-      if (vttObjectUrlRef.current) {
-        URL.revokeObjectURL(vttObjectUrlRef.current);
-        vttObjectUrlRef.current = null;
+  const subtitleTimings = useMemo(() => {
+    return subtitles.map((sub) => ({
+      start: timeToSeconds(sub.startTime),
+      end: timeToSeconds(sub.endTime),
+    }));
+  }, [subtitles]);
+
+  const activeSubtitles = useMemo(() => {
+    if (subtitles.length === 0 || !Number.isFinite(currentPlaybackTime)) {
+      return [];
+    }
+    const result: typeof subtitles = [];
+    for (let i = 0; i < subtitles.length; i++) {
+      const timing = subtitleTimings[i];
+      if (
+        timing &&
+        currentPlaybackTime >= timing.start &&
+        currentPlaybackTime < timing.end
+      ) {
+        result.push(subtitles[i]);
       }
-      return;
     }
-
-    const vttString = subtitlesToVttString(subtitles);
-    const blob = new Blob([vttString], { type: "text/vtt" });
-    const objectUrl = URL.createObjectURL(blob);
-
-    if (playerRef.current) {
-      timeToRestore.current = playerRef.current.currentTime ?? null;
-    }
-
-    if (vttObjectUrlRef.current) {
-      URL.revokeObjectURL(vttObjectUrlRef.current);
-    }
-
-    vttObjectUrlRef.current = objectUrl;
-    setVttUrl(objectUrl);
-
-    return () => {
-      URL.revokeObjectURL(objectUrl);
-      if (vttObjectUrlRef.current === objectUrl) {
-        vttObjectUrlRef.current = null;
-      }
-    };
-  }, [subtitles, mediaUrl]);
+    return result;
+  }, [subtitles, subtitleTimings, currentPlaybackTime]);
 
   const handleLoadedMetadata = useCallback(
     (event: SyntheticEvent<HTMLVideoElement>) => {
       playerRef.current = event.currentTarget;
       if (timeToRestore.current !== null) {
         event.currentTarget.currentTime = timeToRestore.current;
+        setCurrentPlaybackTime(timeToRestore.current);
         timeToRestore.current = null;
+      } else {
+        setCurrentPlaybackTime(event.currentTarget.currentTime);
       }
       if (Number.isFinite(event.currentTarget.duration)) {
         onDuration(event.currentTarget.duration);
@@ -288,7 +288,7 @@ const VideoPlayer = forwardRef(function VideoPlayer(
   }
 
   return (
-    <div className="w-full h-full flex items-center justify-center bg-black overflow-hidden">
+    <div className="relative w-full h-full flex items-center justify-center bg-black overflow-hidden select-none">
       <video
         key={mediaUrl}
         ref={setVideoRef}
@@ -302,10 +302,12 @@ const VideoPlayer = forwardRef(function VideoPlayer(
           const player = event.currentTarget;
           if (!player.seeking) {
             onProgress(player.currentTime);
+            setCurrentPlaybackTime(player.currentTime);
           }
         }}
         onSeeked={(event) => {
           onProgress(event.currentTarget.currentTime);
+          setCurrentPlaybackTime(event.currentTarget.currentTime);
         }}
         onPlay={() => onPlayPause(true)}
         onPause={() => {
@@ -317,18 +319,19 @@ const VideoPlayer = forwardRef(function VideoPlayer(
         onLoadedMetadata={handleLoadedMetadata}
         onLoadedData={handleLoadedMetadata}
         onDurationChange={(event) => onDuration(event.currentTarget.duration)}
-      >
-        {vttUrl ? (
-          <track
-            key={vttUrl}
-            kind="subtitles"
-            src={vttUrl}
-            label={t("videoPlayer.subtitles")}
-            srcLang="unknown"
-            default
-          />
-        ) : null}
-      </video>
+      />
+      {activeSubtitles.length > 0 ? (
+        <div className="absolute inset-x-0 bottom-6 sm:bottom-10 flex flex-col items-center gap-2 px-4 pointer-events-none z-10">
+          {activeSubtitles.map((sub) => (
+            <div
+              key={sub.uuid}
+              className="max-w-[85%] text-center text-white text-base sm:text-lg md:text-xl font-medium px-3.5 py-1.5 rounded-md bg-black/75 shadow-lg whitespace-pre-wrap select-none leading-relaxed tracking-wide"
+            >
+              {sub.text}
+            </div>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 });
